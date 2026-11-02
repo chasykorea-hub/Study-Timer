@@ -1,0 +1,26 @@
+# Runtime data
+study_timer.sqlite3
+*.sqlite3
+
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Logs and editor/OS files
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Local test artifacts
+htmlcov/
+.pytest_cache/
+coverage.xml
