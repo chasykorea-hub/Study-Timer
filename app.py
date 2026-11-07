@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
+import os
 import sqlite3
 from typing import Optional
 
@@ -11,7 +12,8 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "study_timer.sqlite3"
+DB_PATH = Path(os.getenv("STUDY_TIMER_DB_PATH", str(BASE_DIR / "study_timer.sqlite3"))).expanduser()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 

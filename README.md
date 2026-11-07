@@ -22,7 +22,20 @@ cd /path/to/HW2_StudyTimer/upload
 python3 -m uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
-브라우저에서 <http://127.0.0.1:8000>을 열고 이름과 과목을 입력합니다. 테스트할 때는 집중·휴식 시간을 짧게 설정할 수 있습니다. 실행 시 `study_timer.sqlite3`가 `upload` 폴더에 자동 생성됩니다.
+브라우저에서 <http://127.0.0.1:8000>을 열고 이름과 과목을 입력합니다. 테스트할 때는 집중·휴식 시간을 짧게 설정할 수 있습니다. 로컬 실행에서는 `STUDY_TIMER_DB_PATH`를 지정하지 않으면 `app.py`와 같은 폴더의 `study_timer.sqlite3`에 저장됩니다.
+
+## Docker 실행
+
+```bash
+docker build -t study-timer .
+docker run --rm -p 8000:8000 -v study-timer-data:/data study-timer
+```
+
+Dockerfile은 컨테이너에서 `STUDY_TIMER_DB_PATH=/data/study_timer.sqlite3`를 기본값으로 설정합니다. `/data`를 named volume에 연결하면 새 이미지로 컨테이너를 교체해도 SQLite 기록이 유지됩니다. 다른 경로가 필요하면 `-e STUDY_TIMER_DB_PATH=/data/custom.sqlite3`로 지정하세요.
+
+## GitHub Actions / Docker Hub
+
+`main` 브랜치에 push하면 `.github/workflows/ci.yml`이 `linux/amd64`와 `linux/arm64` 이미지를 빌드해 Docker Hub의 `study-timer:latest` 및 커밋 SHA 태그로 업로드합니다. 저장소 Secrets에 `DOCKERHUB_USERNAME`과 `DOCKERHUB_TOKEN`을 등록해야 합니다.
 
 ## GitHub 업로드 전 확인
 
