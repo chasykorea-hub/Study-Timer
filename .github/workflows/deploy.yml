@@ -50,9 +50,9 @@ jobs:
               phase="$(cat "${monitor_phase}" 2>/dev/null || echo before)"
               for endpoint in health stats; do
                 body="${monitor_dir}/response-${endpoint}.json"
-                url="http://127.0.0.1:8000/${endpoint}"
+                url="http://127.0.0.1:8000/health"
                 if [[ "${endpoint}" == stats ]]; then
-                  url="${url}?user_name=ci-monitor"
+                  url="http://127.0.0.1:8000/api/stats?user_name=ci-monitor"
                 fi
                 result="$(curl --max-time 3 --silent --show-error --output "${body}" --write-out '%{http_code} %{time_total}' "${url}" 2>/dev/null || echo '000 0')"
                 status="${result%% *}"
@@ -85,18 +85,18 @@ jobs:
             {
               echo '## Deployment availability verification'
               echo
-              echo '| Phase | Requests | Successes | Failures | Response versions |'
-              echo '|---|---:|---:|---:|---|'
+              echo '| Phase | Requests | Successes | Failures | Health success/fail | Stats success/fail | Response versions |'
+              echo '|---|---:|---:|---:|---:|---:|---|'
               for phase in before during after; do
                 if [[ "${phase}" == before && "${before_enabled}" != true ]]; then
                   echo "| ${phase} | skipped (no previous service) | - | - | - |"
                   continue
                 fi
-                totals="$(awk -F, -v p="${phase}" 'NR>1 && $2==p {total++; if ($4 ~ /^2[0-9][0-9]$/) ok++; else bad++} END {printf "%d %d %d", total+0, ok+0, bad+0}' "${monitor_log}")"
-                read -r total ok bad <<<"${totals}"
+                totals="$(awk -F, -v p="${phase}" 'NR>1 && $2==p {total++; success=($4 ~ /^2[0-9][0-9]$/); if (success) ok++; else bad++; if ($3=="health") {if (success) health_ok++; else health_bad++} if ($3=="stats") {if (success) stats_ok++; else stats_bad++}} END {printf "%d %d %d %d %d %d %d", total+0, ok+0, bad+0, health_ok+0, health_bad+0, stats_ok+0, stats_bad+0}' "${monitor_log}")"
+                read -r total ok bad health_ok health_bad stats_ok stats_bad <<<"${totals}"
                 versions="$(awk -F, -v p="${phase}" 'NR>1 && $2==p && $5!="" {v[$5]=1} END {first=1; for (x in v) {if (!first) printf ", "; printf "%s", x; first=0}}' "${monitor_log}" | sort -u | paste -sd ', ' -)"
                 [[ -n "${versions}" ]] || versions='-'
-                echo "| ${phase} | ${total} | ${ok} | ${bad} | ${versions} |"
+                echo "| ${phase} | ${total} | ${ok} | ${bad} | ${health_ok}/${health_bad} | ${stats_ok}/${stats_bad} | ${versions} |"
               done
               echo
               echo "Full request log: workflow artifact \`study-timer-deployment-monitor\`."
