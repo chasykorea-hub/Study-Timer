@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("STUDY_TIMER_DB_PATH", str(BASE_DIR / "study_timer.sqlite3"))).expanduser()
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+APP_VERSION = os.getenv("APP_VERSION", "local")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
@@ -51,6 +52,11 @@ class RecordIn(BaseModel):
     subject: str = Field(min_length=1, max_length=100)
     started_at: Optional[datetime] = None
     minutes: int = Field(default=25, ge=1, le=240)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": APP_VERSION}
 
 
 def clean(value: str, label: str):

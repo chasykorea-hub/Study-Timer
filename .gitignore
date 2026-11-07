@@ -17,6 +17,9 @@ env/
 # Logs and editor/OS files
 *.log
 .DS_Store
+.deploy/
+.runner/
+_work/
 .vscode/
 .idea/
 

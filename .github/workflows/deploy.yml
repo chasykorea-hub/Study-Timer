@@ -1,0 +1,168 @@
+name: Deploy Docker image to macOS runner
+
+on:
+  workflow_run:
+    workflows: ["Build and publish Docker image"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/study-timer
+  DEPLOY_NETWORK: study-timer-network
+  DATA_VOLUME: study-timer-data
+  PROXY_CONTAINER: study-timer-proxy
+
+jobs:
+  deploy:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_branch == 'main' }}
+    runs-on: [self-hosted, macOS]
+    steps:
+      - name: Check out deployed revision
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Deploy blue/green application
+        env:
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          command -v docker >/dev/null || { echo "Docker is required on the self-hosted runner."; exit 1; }
+
+          echo "${DOCKERHUB_TOKEN}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
+          trap 'docker logout >/dev/null 2>&1 || true' EXIT
+          docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
+          docker network inspect "${DEPLOY_NETWORK}" >/dev/null 2>&1 || docker network create "${DEPLOY_NETWORK}"
+          docker volume inspect "${DATA_VOLUME}" >/dev/null 2>&1 || docker volume create "${DATA_VOLUME}"
+
+          active=""
+          if docker ps --format '{{.Names}}' | grep -qx "${PROXY_CONTAINER}"; then
+            proxy_config="$(docker exec "${PROXY_CONTAINER}" cat /etc/nginx/nginx.conf)"
+            blue_in_proxy=false
+            green_in_proxy=false
+            grep -Eq "server[[:space:]]+study-timer-blue:8000" <<<"${proxy_config}" && blue_in_proxy=true
+            grep -Eq "server[[:space:]]+study-timer-green:8000" <<<"${proxy_config}" && green_in_proxy=true
+            if [[ "${blue_in_proxy}" == true && "${green_in_proxy}" == true ]] || \
+               [[ "${blue_in_proxy}" == false && "${green_in_proxy}" == false ]]; then
+              echo "Could not determine exactly one active backend from ${PROXY_CONTAINER}."
+              exit 1
+            fi
+            if [[ "${blue_in_proxy}" == true ]]; then
+              active=blue
+            else
+              active=green
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx "study-timer-${active}"; then
+              echo "Proxy points to ${active}, but that container is not running; refusing deployment."
+              exit 1
+            fi
+          else
+            blue_running=false
+            green_running=false
+            docker ps --format '{{.Names}}' | grep -qx study-timer-blue && blue_running=true
+            docker ps --format '{{.Names}}' | grep -qx study-timer-green && green_running=true
+            if [[ "${blue_running}" == true && "${green_running}" == true ]]; then
+              echo "Both blue and green are running but the proxy is unavailable; refusing deployment."
+              exit 1
+            elif [[ "${blue_running}" == true ]]; then
+              active=blue
+            elif [[ "${green_running}" == true ]]; then
+              active=green
+            fi
+          fi
+          if [[ "${active}" == "blue" ]]; then next=green; else next=blue; fi
+          next_container="study-timer-${next}"
+          old_container=""
+          if [[ -n "${active}" ]]; then
+            old_container="study-timer-${active}"
+          fi
+
+          docker rm -f "${next_container}" >/dev/null 2>&1 || true
+          docker run -d \
+            --name "${next_container}" \
+            --network "${DEPLOY_NETWORK}" \
+            --restart unless-stopped \
+            --env "APP_VERSION=${IMAGE_TAG}" \
+            --env STUDY_TIMER_DB_PATH=/data/study_timer.sqlite3 \
+            --volume "${DATA_VOLUME}:/data" \
+            "${IMAGE_NAME}:${IMAGE_TAG}"
+
+          echo "Waiting for ${next_container} health check..."
+          healthy=false
+          for attempt in $(seq 1 60); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' "${next_container}" 2>/dev/null || true)"
+            if [[ "${status}" == "healthy" ]]; then
+              healthy=true
+              break
+            fi
+            if [[ "${status}" == "unhealthy" || "${status}" == "" ]]; then
+              docker logs "${next_container}" || true
+            fi
+            sleep 2
+          done
+          if [[ "${healthy}" != true ]]; then
+            echo "Health check failed for ${next_container}; keeping ${old_container:-no previous container} running."
+            docker inspect "${next_container}" || true
+            docker logs "${next_container}" || true
+            docker rm -f "${next_container}" >/dev/null 2>&1 || true
+            exit 1
+          fi
+
+          cat > "${RUNNER_TEMP}/study-timer-nginx.conf" <<EOF
+          events {}
+          http {
+            upstream study_timer_backend { server ${next_container}:8000; }
+            server {
+              listen 8000;
+              location / { proxy_pass http://study_timer_backend; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; }
+            }
+          }
+          EOF
+
+          if ! docker ps --format '{{.Names}}' | grep -qx "${PROXY_CONTAINER}"; then
+            docker rm -f "${PROXY_CONTAINER}" >/dev/null 2>&1 || true
+            docker run -d \
+              --name "${PROXY_CONTAINER}" \
+              --network "${DEPLOY_NETWORK}" \
+              --restart unless-stopped \
+              --publish 127.0.0.1:8000:8000 \
+              nginx:1.27-alpine
+          fi
+
+          # Keep the proxy configuration inside the container. RUNNER_TEMP is only
+          # used as a transient docker cp source and is never bind-mounted.
+          docker cp "${RUNNER_TEMP}/study-timer-nginx.conf" "${PROXY_CONTAINER}:/tmp/nginx.conf.next"
+          docker exec "${PROXY_CONTAINER}" nginx -t -c /tmp/nginx.conf.next
+          if [[ -n "${old_container}" ]]; then
+            docker cp "${PROXY_CONTAINER}:/etc/nginx/nginx.conf" "${RUNNER_TEMP}/nginx.conf.previous"
+          fi
+          docker cp "${RUNNER_TEMP}/study-timer-nginx.conf" "${PROXY_CONTAINER}:/etc/nginx/nginx.conf"
+          if ! docker exec "${PROXY_CONTAINER}" nginx -t; then
+            if [[ -n "${old_container}" ]]; then
+              docker cp "${RUNNER_TEMP}/nginx.conf.previous" "${PROXY_CONTAINER}:/etc/nginx/nginx.conf"
+              docker exec "${PROXY_CONTAINER}" nginx -s reload || true
+            fi
+            docker rm -f "${next_container}" >/dev/null 2>&1 || true
+            exit 1
+          fi
+          if ! docker exec "${PROXY_CONTAINER}" nginx -s reload; then
+            if [[ -n "${old_container}" ]]; then
+              docker cp "${RUNNER_TEMP}/nginx.conf.previous" "${PROXY_CONTAINER}:/etc/nginx/nginx.conf"
+              docker exec "${PROXY_CONTAINER}" nginx -s reload || true
+            fi
+            docker rm -f "${next_container}" >/dev/null 2>&1 || true
+            exit 1
+          fi
+
+          if [[ -n "${old_container}" ]]; then
+            docker rm -f "${old_container}" >/dev/null 2>&1 || true
+          fi
+          echo "Deployment complete: ${IMAGE_NAME}:${IMAGE_TAG} (${next})."
