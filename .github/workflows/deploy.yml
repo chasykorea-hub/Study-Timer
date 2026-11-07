@@ -37,8 +37,88 @@ jobs:
 
           command -v docker >/dev/null || { echo "Docker is required on the self-hosted runner."; exit 1; }
 
+          monitor_dir="${RUNNER_TEMP}/study-timer-monitor"
+          monitor_log="${monitor_dir}/requests.csv"
+          monitor_phase="${monitor_dir}/phase"
+          monitor_stop="${monitor_dir}/stop"
+          mkdir -p "${monitor_dir}"
+          printf 'timestamp,phase,endpoint,status,version,response_ms\n' > "${monitor_log}"
+          printf 'before\n' > "${monitor_phase}"
+          rm -f "${monitor_stop}"
+          monitor_loop() {
+            while [[ ! -f "${monitor_stop}" ]]; do
+              phase="$(cat "${monitor_phase}" 2>/dev/null || echo before)"
+              for endpoint in health stats; do
+                body="${monitor_dir}/response-${endpoint}.json"
+                url="http://127.0.0.1:8000/${endpoint}"
+                if [[ "${endpoint}" == stats ]]; then
+                  url="${url}?user_name=ci-monitor"
+                fi
+                result="$(curl --max-time 3 --silent --show-error --output "${body}" --write-out '%{http_code} %{time_total}' "${url}" 2>/dev/null || echo '000 0')"
+                status="${result%% *}"
+                seconds="${result#* }"
+                response_ms="$(python3 -c "print(round(float('${seconds}') * 1000, 1))" 2>/dev/null || echo 0)"
+                version=""
+                if [[ -s "${body}" ]]; then
+                  version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version", ""))' "${body}" 2>/dev/null || true)"
+                fi
+                printf '%s,%s,%s,%s,%s,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${phase}" "${endpoint}" "${status}" "${version}" "${response_ms}" >> "${monitor_log}"
+              done
+              sleep 0.5
+            done
+          }
+          monitor_loop &
+          monitor_pid=$!
+          before_enabled=false
+          sleep 2
+          if curl --max-time 3 --silent --fail http://127.0.0.1:8000/health >/dev/null 2>&1; then
+            before_enabled=true
+          fi
+          summary_written=false
+          finish_deploy() {
+            rc=$?
+            printf 'after\n' > "${monitor_phase}"
+            sleep 10
+            touch "${monitor_stop}"
+            wait "${monitor_pid}" 2>/dev/null || true
+
+            {
+              echo '## Deployment availability verification'
+              echo
+              echo '| Phase | Requests | Successes | Failures | Response versions |'
+              echo '|---|---:|---:|---:|---|'
+              for phase in before during after; do
+                if [[ "${phase}" == before && "${before_enabled}" != true ]]; then
+                  echo "| ${phase} | skipped (no previous service) | - | - | - |"
+                  continue
+                fi
+                totals="$(awk -F, -v p="${phase}" 'NR>1 && $2==p {total++; if ($4 ~ /^2[0-9][0-9]$/) ok++; else bad++} END {printf "%d %d %d", total+0, ok+0, bad+0}' "${monitor_log}")"
+                read -r total ok bad <<<"${totals}"
+                versions="$(awk -F, -v p="${phase}" 'NR>1 && $2==p && $5!="" {v[$5]=1} END {first=1; for (x in v) {if (!first) printf ", "; printf "%s", x; first=0}}' "${monitor_log}" | sort -u | paste -sd ', ' -)"
+                [[ -n "${versions}" ]] || versions='-'
+                echo "| ${phase} | ${total} | ${ok} | ${bad} | ${versions} |"
+              done
+              echo
+              echo "Full request log: workflow artifact \`study-timer-deployment-monitor\`."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            summary_written=true
+
+            relevant_failures="$(awk -F, -v skip_before="${before_enabled}" 'NR>1 && ($2!="before" || skip_before=="true") && $4 !~ /^2[0-9][0-9]$/ {n++} END {print n+0}' "${monitor_log}")"
+            last_version="$(awk -F, 'NR>1 && $5!="" {v=$5} END {print v}' "${monitor_log}")"
+            if [[ "${rc}" -eq 0 && "${relevant_failures}" -gt 0 ]]; then
+              echo "Deployment monitor detected ${relevant_failures} failed request(s)." >&2
+              rc=1
+            fi
+            if [[ "${rc}" -eq 0 && "${last_version}" != "${IMAGE_TAG}" ]]; then
+              echo "Deployment monitor ended on version '${last_version}', expected '${IMAGE_TAG}'." >&2
+              rc=1
+            fi
+            docker logout >/dev/null 2>&1 || true
+            exit "${rc}"
+          }
+          trap finish_deploy EXIT
+
           echo "${DOCKERHUB_TOKEN}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
-          trap 'docker logout >/dev/null 2>&1 || true' EXIT
           docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
           docker network inspect "${DEPLOY_NETWORK}" >/dev/null 2>&1 || docker network create "${DEPLOY_NETWORK}"
           docker volume inspect "${DATA_VOLUME}" >/dev/null 2>&1 || docker volume create "${DATA_VOLUME}"
@@ -85,6 +165,7 @@ jobs:
             old_container="study-timer-${active}"
           fi
 
+          printf 'during\n' > "${monitor_phase}"
           docker rm -f "${next_container}" >/dev/null 2>&1 || true
           docker run -d \
             --name "${next_container}" \
@@ -162,7 +243,17 @@ jobs:
             exit 1
           fi
 
+          printf 'after\n' > "${monitor_phase}"
+          sleep 5
           if [[ -n "${old_container}" ]]; then
             docker rm -f "${old_container}" >/dev/null 2>&1 || true
           fi
           echo "Deployment complete: ${IMAGE_NAME}:${IMAGE_TAG} (${next})."
+
+      - name: Upload deployment request log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: study-timer-deployment-monitor
+          path: ${{ runner.temp }}/study-timer-monitor/requests.csv
+          if-no-files-found: warn

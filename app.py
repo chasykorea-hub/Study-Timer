@@ -98,4 +98,17 @@ async def stats(user_name: str):
         daily[row["study_date"]] += row["minutes"]
         if row["study_date"] == today.isoformat():
             subjects[row["subject"]] = subjects.get(row["subject"], 0) + row["minutes"]
-    return {"today": [{"subject": k, "minutes": v} for k, v in sorted(subjects.items())], "last_7_days": [{"date": k, "minutes": v} for k, v in daily.items()]}
+    total_minutes = sum(daily.values())
+    streak = 0
+    cursor = today
+    while daily.get(cursor.isoformat(), 0) > 0:
+        streak += 1
+        cursor -= timedelta(days=1)
+    return {
+        "today": [{"subject": k, "minutes": v} for k, v in sorted(subjects.items())],
+        "last_7_days": [{"date": k, "minutes": v} for k, v in daily.items()],
+        "seven_day_total_minutes": total_minutes,
+        "seven_day_average_minutes": round(total_minutes / 7, 1),
+        "current_streak_days": streak,
+        "version": APP_VERSION,
+    }
